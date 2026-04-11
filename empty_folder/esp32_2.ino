@@ -2,18 +2,14 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include "esp_sleep.h"
 
-// Pin definitions for ESP32(2)
-#define BUTTON_1_PIN 14
-#define BUTTON_2_PIN 27
-#define RED_LED_PIN 2
-#define GREEN_LED_PIN 15
-#define TOGGLE_SWITCH_PIN 13
+#define BUTTON_PIN 14
+#define RED_LED_PIN 18
+#define GREEN_LED_PIN 19
 
-// LCD setup (I2C) - ESP32 Compatible
-LiquidCrystal_I2C lcd(0x27, 16, 2); // Address 0x27, 16x2 display
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// Data structure to receive
 typedef struct {
   uint8_t plant1_moisture;
   uint8_t plant2_moisture;
@@ -22,139 +18,135 @@ typedef struct {
 
 soil_data_t receivedData;
 bool dataReceived = false;
-unsigned long wakeTime = 0;
-const unsigned long DISPLAY_TIME = 30000; // 30 seconds
+bool hasValidData = false;
+unsigned long displayStartTime = 0;
+const unsigned long HUMIDITY_TIME = 30000;
+const unsigned long COUNTDOWN_TIME = 10000;
+
+void onDataReceived(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len);
 
 void setup() {
   Serial.begin(115200);
-  
-  // Initialize pins
-  pinMode(BUTTON_1_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_2_PIN, INPUT_PULLUP);
+  delay(1000);
+
+  Serial.println("=== LIGHT SLEEP DISPLAY ===");
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(RED_LED_PIN, OUTPUT);
   pinMode(GREEN_LED_PIN, OUTPUT);
-  pinMode(TOGGLE_SWITCH_PIN, INPUT_PULLUP);
-  
-  // Initialize LCD
-  Wire.begin(21, 22); // SDA=GPIO21, SCL=GPIO22
+
+  Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("ESP32(2) Ready");
-  
-  // Set WiFi station mode
+
   WiFi.mode(WIFI_STA);
-  
-  // Initialize ESP-NOW
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW Init Failed");
-    return;
-  }
-  
-  // FIXED: ESP32 Core 3.0+ Receive Callback
+  esp_now_init();
   esp_now_register_recv_cb(onDataReceived);
-  
-  Serial.println("ESP32(2) Display Node Ready");
-  Serial.print("My MAC: ");
-  Serial.println(WiFi.macAddress());
+
+  displayStartTime = millis();
+  Serial.println("Ready");
 }
 
 void loop() {
-  // Button wake-up
-  if (digitalRead(BUTTON_1_PIN) == LOW || digitalRead(BUTTON_2_PIN) == LOW) {
-    wakeUpDisplay();
-    delay(200);
+  unsigned long elapsed = millis() - displayStartTime;
+
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    Serial.println("Button pressed!");
+    buttonPressed();
+    delay(500);
+    return;
   }
-  
-  // Toggle switch - continuous mode
-  if (digitalRead(TOGGLE_SWITCH_PIN) == LOW) {
-    continuousDisplayMode();
+
+  if (dataReceived || hasValidData) {
+    displayHumidity();
+    dataReceived = false;
+  } else if (elapsed < HUMIDITY_TIME) {
+    showNoDataScreen();
+  } else if (elapsed < (HUMIDITY_TIME + COUNTDOWN_TIME)) {
+    showCountdown();
+  } else {
+    Serial.println("Entering light sleep...");
+    lightSleepWake();
   }
-  
-  // Show data if received recently
-  if (dataReceived && (millis() - wakeTime < DISPLAY_TIME)) {
-    displayData();
-  } else if (dataReceived && (millis() - wakeTime >= DISPLAY_TIME)) {
-    goToSleep();
-  }
-  
-  delay(100);
+
+  delay(1000);
 }
 
-void wakeUpDisplay() {
-  Serial.println("Button pressed - Wake up");
-  digitalWrite(GREEN_LED_PIN, HIGH);
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Waking up...");
-  delay(500);
-  wakeTime = millis();
-}
-
-void continuousDisplayMode() {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("CONTINUOUS MODE");
-  lcd.setCursor(0, 1);
-  lcd.print("Switch: OFF");
-  digitalWrite(GREEN_LED_PIN, HIGH);
-  delay(1500);
-  
-  while (digitalRead(TOGGLE_SWITCH_PIN) == LOW) {
-    displayData();
-    delay(2500);
+void onDataReceived(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+  if (len == sizeof(soil_data_t)) {
+    memcpy(&receivedData, data, sizeof(soil_data_t));
+    dataReceived = true;
+    Serial.printf("Data received: P1=%d%% P2=%d%%\n",
+                  receivedData.plant1_moisture,
+                  receivedData.plant2_moisture);
+  } else {
+    Serial.printf("Unexpected data length: %d\n", len);
   }
-  
-  goToSleep();
 }
 
-void displayData() {
+void buttonPressed() {
+  displayStartTime = millis();
+  lcd.backlight();
   lcd.clear();
-  
-  // LED status (30% threshold)
-  bool plant1Good = receivedData.plant1_moisture > 30;
-  bool plant2Good = receivedData.plant2_moisture > 30;
-  
-  // Update LEDs
-  digitalWrite(RED_LED_PIN, (plant1Good && plant2Good) ? LOW : HIGH);
-  digitalWrite(GREEN_LED_PIN, (plant1Good && plant2Good) ? HIGH : LOW);
-  
-  // Plant 1
+  lcd.print("Button OK!");
+  delay(1000);
+}
+
+void lightSleepWake() {
+  lcd.noBacklight();
+  digitalWrite(RED_LED_PIN, LOW);
+  digitalWrite(GREEN_LED_PIN, LOW);
+
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);
+  esp_light_sleep_start();
+
+  // Resumes here after wake
+  Serial.println("Woke from light sleep!");
+  displayStartTime = millis();  // prevents immediate re-sleep
+  lcd.backlight();              // turn screen back on
+  dataReceived = false;
+  delay(300);                   // debounce button
+}
+
+void displayHumidity() {
+  bool p1Good = receivedData.plant1_moisture > 30;
+  bool p2Good = receivedData.plant2_moisture > 30;
+
+  digitalWrite(RED_LED_PIN,   (p1Good && p2Good) ? LOW  : HIGH);
+  digitalWrite(GREEN_LED_PIN, (p1Good && p2Good) ? HIGH : LOW);
+
+  lcd.clear();
+  lcd.backlight();
   lcd.setCursor(0, 0);
-  lcd.print("P1: ");
+  lcd.print("P1:");
   lcd.print(receivedData.plant1_moisture);
   lcd.print("% ");
-  lcd.print(plant1Good ? "OK" : "DRY");
-  
-  // Plant 2
+  lcd.print(p1Good ? "OK" : "DRY");
+
   lcd.setCursor(0, 1);
-  lcd.print("P2: ");
+  lcd.print("P2:");
   lcd.print(receivedData.plant2_moisture);
   lcd.print("% ");
-  lcd.print(plant2Good ? "OK" : "DRY");
+  lcd.print(p2Good ? "OK" : "DRY");
+
+  hasValidData = true;
+  displayStartTime = millis();
 }
 
-void goToSleep() {
+void showNoDataScreen() {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Sleep Mode");
+  lcd.print("No Data");
   lcd.setCursor(0, 1);
-  lcd.print("Press Button");
-  dataReceived = false;
-  digitalWrite(GREEN_LED_PIN, LOW);
-  digitalWrite(RED_LED_PIN, LOW);
+  lcd.print("Wait ESP32-1");
 }
 
-// FIXED CALLBACK - ESP32 Arduino Core 3.0+ Compatible
-void onDataReceived(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
-  memcpy(&receivedData, data, sizeof(receivedData));
-  dataReceived = true;
-  wakeTime = millis();
-  
-  const uint8_t* mac = recv_info->src_addr;
-  Serial.printf("Received from %02X:%02X:%02X:%02X:%02X:%02X\n", 
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  Serial.printf("P1: %d%% | P2: %d%%\n\n", 
-                receivedData.plant1_moisture, receivedData.plant2_moisture);
+void showCountdown() {
+  int countdown = (HUMIDITY_TIME + COUNTDOWN_TIME - (millis() - displayStartTime)) / 1000;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Sleep in:");
+  lcd.setCursor(0, 1);
+  lcd.print(countdown);
+  lcd.print("s  GPIO14");
 }
